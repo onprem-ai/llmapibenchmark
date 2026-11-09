@@ -4,6 +4,13 @@
 
 The LLM API Benchmark Tool is a flexible Go-based utility designed to measure and analyze the performance of OpenAI-compatible API endpoints across different concurrency levels. This tool provides in-depth insights into API throughput, generation speed, and token processing capabilities.
 
+## Workloads and ladder mode
+
+`--concurrency auto --format jsonl --workload <id>` measures one versioned
+workload and writes one JSON object per line: start, calibration, one per
+finished level, end. The workloads, the method and every figure are defined in
+[WORKLOADS.md](WORKLOADS.md).
+
 ## Key Features
 
 - 🚀 Dynamic Concurrency Testing

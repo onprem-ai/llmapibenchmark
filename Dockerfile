@@ -15,8 +15,11 @@ RUN go mod download
 # Copy the source code
 COPY . .
 
+# The version the tool reports in its start record.
+ARG VERSION=dev
+
 # Build the binary (static linking)
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /llmapibenchmark ./cmd
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=${VERSION}" -o /llmapibenchmark ./cmd
 
 # ---- Runtime stage ----
 FROM alpine:3.20
@@ -26,6 +29,9 @@ RUN apk add --no-cache ca-certificates
 
 # Copy the compiled binary from builder
 COPY --from=builder /llmapibenchmark /usr/local/bin/llmapibenchmark
+
+# Run as an unprivileged user: the tool needs no file and no privilege.
+USER 65534:65534
 
 # Set entrypoint to the benchmark executable
 ENTRYPOINT ["llmapibenchmark"]

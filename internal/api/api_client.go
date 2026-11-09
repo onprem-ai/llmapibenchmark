@@ -60,6 +60,10 @@ const (
 	TtftSourceNone     = "none"
 )
 
+// PlainWarnings drops the ANSI colour from warnings on stderr. Set it before
+// sending requests, for consumers that parse stderr as plain text.
+var PlainWarnings bool
+
 var (
 	unknownFieldMu     sync.Mutex
 	unknownFieldWarned = map[string]bool{}
@@ -77,6 +81,15 @@ type ChatResult struct {
 	PromptTokens     int
 	// Duration is the total wall time of the request, including prefill.
 	Duration float64
+	// StartedAt is when the request was sent, FirstTokenAt when the first
+	// output token arrived on a content field (zero when none did), and
+	// EndedAt when the stream ended.
+	StartedAt    time.Time
+	FirstTokenAt time.Time
+	EndedAt      time.Time
+	// UsageReported is true when the server sent a usage chunk, so
+	// PromptTokens and CompletionTokens are the server's own counts.
+	UsageReported bool
 }
 
 // NewClient creates a client for an OpenAI-compatible endpoint.
@@ -96,31 +109,58 @@ func NewClient(baseURL, apiVersion, apiKey string, opts ...option.RequestOption)
 	return openai.NewClient(requestOptions...)
 }
 
+// ChatRequest describes one streaming chat completion.
+type ChatRequest struct {
+	Model     string
+	Prompt    string
+	MaxTokens int
+	// Bar, when set, advances with every output token.
+	Bar *progressbar.ProgressBar
+	// Options are appended to the request, for example option.WithJSONSet.
+	Options []option.RequestOption
+}
+
 // AskOpenAi sends a prompt to the OpenAI API, processes the response stream and returns stats on it.
 func AskOpenAi(client openai.Client, model string, prompt string, maxTokens int, bar *progressbar.ProgressBar) (ChatResult, error) {
+	return StreamChat(context.Background(), client, ChatRequest{
+		Model:     model,
+		Prompt:    prompt,
+		MaxTokens: maxTokens,
+		Bar:       bar,
+	})
+}
+
+// StreamChat sends one streaming chat completion and returns its timing and
+// the server's token usage. Cancelling ctx aborts the request.
+func StreamChat(ctx context.Context, client openai.Client, request ChatRequest) (ChatResult, error) {
 	result := ChatResult{TTFTSource: TtftSourceNone}
+	bar := request.Bar
 
 	start := time.Now()
+	result.StartedAt = start
 
 	stream := client.Chat.Completions.NewStreaming(
-		context.Background(),
+		ctx,
 		openai.ChatCompletionNewParams{
-			Model:    model,
-			Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)},
+			Model:    request.Model,
+			Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage(request.Prompt)},
 			// Send both the deprecated `max_tokens` and `max_completion_tokens`
 			// so that older self-hosted servers are still capped correctly.
-			MaxTokens:           openai.Int(int64(maxTokens)),
-			MaxCompletionTokens: openai.Int(int64(maxTokens)),
+			MaxTokens:           openai.Int(int64(request.MaxTokens)),
+			MaxCompletionTokens: openai.Int(int64(request.MaxTokens)),
 			Temperature:         openai.Float(1),
 			StreamOptions: openai.ChatCompletionStreamOptionsParam{
 				// Without this most servers omit `usage` from the stream entirely.
 				IncludeUsage: openai.Bool(true),
 			},
 		},
+		request.Options...,
 	)
+	defer stream.Close()
 
 	var (
 		firstContentAt  float64 // when the first recognised content field arrived
+		firstContentAbs time.Time
 		contentSource   string  // which field it was
 		firstFinishAt   float64 // when finish_reason arrived
 		estimatedTokens int     // real-time token estimation for the progress bar
@@ -152,7 +192,8 @@ func AskOpenAi(client openai.Client, model string, prompt string, maxTokens int,
 			estimatedTokens += newTokens
 
 			if firstContentAt == 0 {
-				firstContentAt = time.Since(start).Seconds()
+				firstContentAbs = time.Now()
+				firstContentAt = firstContentAbs.Sub(start).Seconds()
 				contentSource = source
 			}
 			if bar != nil {
@@ -169,13 +210,15 @@ func AskOpenAi(client openai.Client, model string, prompt string, maxTokens int,
 		return ChatResult{}, fmt.Errorf("stream error: %w", err)
 	}
 
-	result.Duration = time.Since(start).Seconds()
+	result.EndedAt = time.Now()
+	result.Duration = result.EndedAt.Sub(start).Seconds()
 
 	switch {
 	case firstContentAt > 0:
 		result.TTFT = firstContentAt
 		result.TTFTSource = TtftSourceContent
 		result.TTFTField = contentSource
+		result.FirstTokenAt = firstContentAbs
 	case firstFinishAt > 0:
 		// No content field was recognized; the only timestamp is the end of the
 		// stream. Keep it for diagnostics, flagged as not a real TTFT.
@@ -184,6 +227,7 @@ func AskOpenAi(client openai.Client, model string, prompt string, maxTokens int,
 	}
 
 	if usage != nil {
+		result.UsageReported = true
 		result.PromptTokens = int(usage.PromptTokens)
 		result.CompletionTokens = int(usage.CompletionTokens)
 
@@ -262,10 +306,14 @@ func warnUnknownDeltaField(name string) {
 		return
 	}
 
+	warnPrefix := "\033[33m[warn]\033[0m"
+	if PlainWarnings {
+		warnPrefix = "[warn]"
+	}
 	fmt.Fprintf(os.Stderr,
-		"\n\033[33m[warn]\033[0m unrecognized delta field %q (non-empty string).\n"+
+		"\n%s unrecognized delta field %q (non-empty string).\n"+
 			"       If it carries model output, TTFT is underestimated. Add %q to contentFields in internal/api/api_client.go.\n",
-		name, name)
+		warnPrefix, name, name)
 }
 
 func estimateTokens(content string) int {
@@ -295,7 +343,12 @@ func estimateTokens(content string) int {
 
 // GetFirstAvailableModel retrieves the first available model from the OpenAI API.
 func GetFirstAvailableModel(client openai.Client) (string, error) {
-	page, err := client.Models.List(context.Background())
+	return GetFirstAvailableModelContext(context.Background(), client)
+}
+
+// GetFirstAvailableModelContext is GetFirstAvailableModel with a context.
+func GetFirstAvailableModelContext(ctx context.Context, client openai.Client) (string, error) {
+	page, err := client.Models.List(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to list models: %w", err)
 	}

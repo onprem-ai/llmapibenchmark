@@ -41,3 +41,12 @@ func generateRandomPhrase(numWords int) string {
 
 	return result
 }
+
+// RandomWords returns numWords random lowercase words joined by spaces.
+func RandomWords(numWords int) string {
+	words := make([]string, numWords)
+	for i := range words {
+		words[i] = generateRandomWord()
+	}
+	return strings.Join(words, " ")
+}
